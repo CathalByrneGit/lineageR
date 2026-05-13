@@ -1,0 +1,131 @@
+---
+title: "Lineage Overview: registering sources, transforms, and datasets"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Lineage Overview}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+```
+
+## Introduction
+
+`lineageR` builds a directed acyclic graph (DAG) that tracks where data
+comes from, what transformed it, and what would break if it changed.
+
+Four node types exist in the DAG:
+
+| Type          | Meaning                                   |
+|---------------|-------------------------------------------|
+| `source`      | External origin (database, S3, API, …)   |
+| `transform`   | A computation step (R script, SQL, …)    |
+| `dataset`     | A table or file produced by a transform  |
+| `object_type` | An ontologySpecR object type             |
+
+## Setting up a context
+
+```{r, eval = FALSE}
+library(lineageR)
+library(duckdb)
+
+con <- dbConnect(duckdb(), ":memory:")
+ctx <- lineage_context(con)
+```
+
+`lineage_context()` creates the three schema tables (`lineage_nodes`,
+`lineage_edges`, `lineage_run_log`) if they do not already exist, making
+initialisation idempotent.
+
+## Registering nodes
+
+```{r, eval = FALSE}
+# Data sources
+s3_id <- lin_register_source(ctx, "s3_raw_flights",
+  connection_string = "s3://my-bucket/raw/flights/")
+
+pg_id <- lin_register_source(ctx, "postgres_schedules",
+  connection_string = "postgresql://host/db")
+
+# Transform steps
+ingest_id <- lin_register_transform(ctx, "ingest_flights",
+  script_path = "pipelines/ingest.R",
+  language    = "r")
+
+clean_id  <- lin_register_transform(ctx, "clean_airports",
+  script_path = "pipelines/clean.R",
+  language    = "r")
+
+# Datasets (tables) produced by the transforms
+raw_id    <- lin_register_dataset(ctx, "flights_raw",    table_name = "flights_raw")
+clean_id2 <- lin_register_dataset(ctx, "airports_clean", table_name = "airports_clean")
+
+# Object types backed by datasets
+airport_id <- lin_register_object_type(ctx, "Airport")
+```
+
+## Wiring edges
+
+```{r, eval = FALSE}
+lin_add_input(ctx,  ingest_id, s3_id)       # s3   feeds ingest
+lin_add_output(ctx, ingest_id, raw_id)      # ingest produces flights_raw
+
+lin_add_input(ctx,  clean_id,  raw_id)      # flights_raw feeds clean
+lin_add_output(ctx, clean_id,  clean_id2)   # clean produces airports_clean
+
+lin_add_backing(ctx, clean_id2, airport_id) # airports_clean backs Airport
+```
+
+Attempting to add an edge that would create a cycle is detected immediately:
+
+```{r, eval = FALSE}
+# This would make Airport an ancestor of itself — aborts with an error.
+lin_add_input(ctx, s3_id, airport_id)
+```
+
+## Querying provenance
+
+*What raw sources feed the `Airport` object type?*
+
+```{r, eval = FALSE}
+lin_provenance(ctx, airport_id)
+#>          node_id  node_type           name distance last_updated_at
+#> 1 <uuid>          dataset  airports_clean        1              NA
+#> 2 <uuid>          transform  clean_airports      2              NA
+#> 3 <uuid>          dataset    flights_raw         3              NA
+#> 4 <uuid>          transform  ingest_flights      4              NA
+#> 5 <uuid>          source     s3_raw_flights      5              NA
+
+lin_provenance(ctx, airport_id, depth = 1)
+#> Direct parent only: airports_clean
+```
+
+## Querying impact
+
+*If the S3 source changes, what nodes are affected?*
+
+```{r, eval = FALSE}
+lin_impact(ctx, s3_id)
+```
+
+## Checking freshness
+
+After recording a successful run the output datasets' `last_updated_at` is
+updated automatically:
+
+```{r, eval = FALSE}
+run_id <- lin_run_start(ctx, ingest_id)
+# … run the pipeline …
+lin_run_complete(ctx, run_id, rows_produced = 42000L)
+
+lin_stale(ctx)   # returns nodes whose upstream is newer than themselves
+```
+
+## Visualisation
+
+```{r, eval = FALSE}
+lin_plot(ctx)                             # uses visNetwork, ggraph, or igraph
+lin_plot(ctx, highlight_node_id = s3_id) # highlight a node and its subtree
+```

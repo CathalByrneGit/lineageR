@@ -1,0 +1,92 @@
+---
+title: "targets Integration: lin_from_targets() walkthrough"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{targets Integration}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+```
+
+## Overview
+
+`lin_from_targets()` reads a **targets** pipeline manifest and registers each
+target as a `transform` node, wiring dependency edges automatically.
+
+This lets you track lineage without manually calling `lin_register_transform()`
+and `lin_add_input()` / `lin_add_output()` for every step.
+
+## Example pipeline (`_targets.R`)
+
+```{r, eval = FALSE}
+library(targets)
+
+list(
+  tar_target(raw_data,     read_csv("data/raw.csv")),
+  tar_target(clean_data,   clean(raw_data)),
+  tar_target(model_output, fit_model(clean_data)),
+  tar_target(report,       render_report(model_output))
+)
+```
+
+## Importing the pipeline into lineageR
+
+```{r, eval = FALSE}
+library(lineageR)
+library(duckdb)
+
+con <- DBI::dbConnect(duckdb::duckdb(), ":memory:")
+ctx <- lineage_context(con)
+
+node_ids <- lin_from_targets(ctx, pipeline_path = "_targets.R")
+```
+
+`lin_from_targets()` returns a named list mapping each target name to its
+`node_id`:
+
+```
+$raw_data
+[1] "xxxxxxxx-xxxx-4xxx-xxxx-xxxxxxxxxxxx"
+
+$clean_data
+[1] "yyyyyyyy-yyyy-4yyy-yyyy-yyyyyyyyyyyy"
+...
+```
+
+## What gets created
+
+For each target a `transform` node is created.  Dependencies between targets
+become `"produces"` edges:
+
+```
+raw_data  ──produces──>  clean_data  ──produces──>  model_output  ──produces──>  report
+```
+
+## Extending with source and dataset nodes
+
+After importing the targets manifest you can graft in source and dataset nodes
+manually:
+
+```{r, eval = FALSE}
+src_id    <- lin_register_source(ctx, "raw_csv", connection_string = "data/raw.csv")
+report_ds <- lin_register_dataset(ctx, "report_html", table_name = "output/report.html")
+
+lin_add_input(ctx,  node_ids[["raw_data"]], src_id)       # csv -> raw_data
+lin_add_output(ctx, node_ids[["report"]],   report_ds)    # report -> HTML file
+
+lin_plot(ctx)
+```
+
+## Provenance after pipeline run
+
+```{r, eval = FALSE}
+run_id <- lin_run_start(ctx, node_ids[["model_output"]])
+# … fit model …
+lin_run_complete(ctx, run_id, rows_produced = 1L)
+
+lin_stale(ctx)     # downstream of model_output now has a fresh timestamp
+lin_impact(ctx, node_ids[["raw_data"]])   # everything downstream of raw_data
+```

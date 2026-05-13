@@ -1,0 +1,34 @@
+Package: lineageR
+Title: Dataset Lineage and Provenance Tracking for Ontology-Backed Systems
+Version: 0.1.0
+Authors@R:
+    person("lineageR", "Authors", role = c("aut", "cre"),
+           email = "lineager@example.com")
+Description: Register data sources, transforms, and their dependencies to build
+    a lineage DAG for ontology-backed object types. Query provenance (what sources
+    feed this table?), impact (what objects are affected by this source?), and
+    freshness (when was each step last run?).
+Depends: R (>= 4.0)
+Imports:
+    DBI,
+    igraph,
+    dplyr,
+    rlang,
+    jsonlite,
+    cli
+Suggests:
+    ontologySpecR,
+    duckdb,
+    visNetwork,
+    ggraph,
+    ggplot2,
+    targets,
+    testthat (>= 3.0.0),
+    knitr,
+    rmarkdown
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.0
+VignetteBuilder: knitr
+Config/testthat/edition: 3
