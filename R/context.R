@@ -10,7 +10,10 @@
 #' @return A `LineageContext` S3 object.
 #' @export
 lineage_context <- function(connection, bundle = NULL) {
-  ctx <- structure(list(con = connection), class = "LineageContext")
+  ctx <- structure(
+    list(con = connection, ol_config = .default_ol_config()),
+    class = "LineageContext"
+  )
   .init_schema(ctx)
   if (!is.null(bundle)) {
     lin_sync_bundle(ctx, bundle)

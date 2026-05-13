@@ -1,0 +1,214 @@
+---
+title: "OpenLineage Integration: visualising R pipeline lineage in Marquez"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{OpenLineage Integration}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE)
+```
+
+## Why OpenLineage?
+
+[OpenLineage](https://openlineage.io) is the open standard for pipeline
+lineage, adopted by Apache Airflow, Spark, dbt, Dagster, and many others.
+By emitting OpenLineage events, `lineageR` lets R pipelines participate in
+**the same lineage graph** as Python and SQL pipelines — without writing a
+single line of extra glue code.
+
+Benefits:
+
+| Benefit | How |
+|---|---|
+| Free UI | [Marquez](https://marquezproject.ai) provides a graph browser, job history, and column lineage viewer |
+| Interoperability | R, Python, dbt, Spark lineage in one namespace |
+| Future-proof | Any tool that speaks OpenLineage (DataHub, Atlan, OpenMetadata) works automatically |
+
+---
+
+## Step 1 — Start Marquez with Docker
+
+```{r marquez-setup}
+lin_marquez_setup()
+```
+
+This prints the exact Docker command. Copy-paste it into a terminal:
+
+```bash
+docker run --name marquez \
+  -p 5000:5000 -p 6000:6000 \
+  marquezproject/marquez
+```
+
+Marquez API will be at `http://localhost:5000` and the UI at
+`http://localhost:6000`.
+
+---
+
+## Step 2 — Configure lineageR to emit events
+
+```{r configure}
+library(lineageR)
+library(DBI)
+library(duckdb)
+
+con <- dbConnect(duckdb(), "pipeline.duckdb")
+ctx <- lineage_context(con)
+
+# Enable OpenLineage emission — point at local Marquez
+ctx <- lin_openlineage_config(ctx,
+  url       = "http://localhost:5000/api/v1/lineage",
+  namespace = "aviation-demo"
+)
+```
+
+You can also use environment variables so the URL never appears in source
+code:
+
+```bash
+export OL_URL="http://localhost:5000/api/v1/lineage"
+export OL_NAMESPACE="aviation-demo"
+export OL_ENABLED="true"
+```
+
+```{r configure-envvar}
+# If env vars are set, just calling lineage_context() picks them up:
+ctx <- lineage_context(con)   # OL_ENABLED=true, OL_URL and OL_NAMESPACE set
+```
+
+### NDJSON fallback
+
+If `url` is not set (or if the HTTP call fails), events are appended to a
+local NDJSON file. This is useful for offline development or audit trails:
+
+```{r ndjson}
+ctx <- lin_openlineage_config(ctx,
+  ndjson_path = "pipeline_events.ndjson",
+  enabled     = TRUE
+)
+```
+
+---
+
+## Step 3 — Register nodes and wire edges
+
+This is identical to normal `lineageR` usage. Events are emitted
+automatically when runs are recorded — no extra calls needed.
+
+```{r register}
+s3_id     <- lin_register_source(ctx, "s3_raw_flights",
+               connection_string = "s3://my-bucket/raw/flights/")
+ingest_id <- lin_register_transform(ctx, "ingest_flights",
+               script_path = "pipelines/ingest.R", language = "r")
+raw_id    <- lin_register_dataset(ctx, "flights_raw",
+               table_name = "flights_raw")
+
+lin_add_input(ctx,  ingest_id, s3_id)
+lin_add_output(ctx, ingest_id, raw_id)
+```
+
+---
+
+## Step 4 — Record a run (events are emitted automatically)
+
+```{r run}
+run_id <- lin_run_start(ctx, ingest_id)
+# → emits a START event to Marquez
+
+tryCatch({
+  # ... run your pipeline code ...
+  lin_run_complete(ctx, run_id, rows_produced = 48_231L)
+  # → emits a COMPLETE event with input/output datasets
+}, error = function(e) {
+  lin_run_error(ctx, run_id, conditionMessage(e))
+  # → emits a FAIL event with error details
+})
+```
+
+### What the COMPLETE event looks like
+
+```json
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2024-06-01T08:02:14Z",
+  "run":  { "runId": "550e8400-e29b-41d4-a716-446655440000" },
+  "job":  { "namespace": "aviation-demo", "name": "ingest_flights" },
+  "inputs": [
+    { "namespace": "aviation-demo", "name": "s3_raw_flights", "facets": {} }
+  ],
+  "outputs": [
+    {
+      "namespace": "aviation-demo",
+      "name": "flights_raw",
+      "facets": {
+        "schema": {
+          "_producer": "https://github.com/CathalByrneGit/lineageR",
+          "fields": [
+            { "name": "flight_id",  "type": "VARCHAR" },
+            { "name": "origin",     "type": "VARCHAR" },
+            { "name": "dep_time",   "type": "TIMESTAMP" }
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+---
+
+## Viewing lineage in Marquez
+
+Open `http://localhost:6000` in a browser. After a few runs you will see:
+
+- **Job graph** — a DAG of all transform steps in the `aviation-demo` namespace
+- **Dataset lineage** — which datasets feed which transforms
+- **Run history** — status (success / fail), run timestamps, row counts
+- **Column lineage** — field-level provenance when `cell_expression_lineage`
+  records exist
+
+---
+
+## Backfilling existing runs
+
+If lineageR already has run history but Marquez was not configured yet, use
+`lin_replay_events()` to backfill:
+
+```{r replay}
+lin_replay_events(ctx)
+# or replay only recent runs:
+lin_replay_events(ctx, since = as.POSIXct("2024-01-01"))
+```
+
+---
+
+## Sharing a namespace with dbt
+
+If a dbt project also pushes OpenLineage events to the same Marquez instance
+and the same namespace, the full end-to-end lineage graph (dbt models →
+lineageR transforms → ontologySpecR object types) will appear in a single
+connected graph.
+
+In `profiles.yml` (dbt-core ≥ 1.6 with the `dbt-openlineage` adapter):
+
+```yaml
+my_project:
+  outputs:
+    prod:
+      type: duckdb
+      openlineage_url: http://localhost:5000/api/v1/lineage
+      openlineage_namespace: aviation-demo   # same namespace as lineageR
+```
+
+---
+
+## Disabling emission
+
+```{r disable}
+ctx <- lin_openlineage_config(ctx, enabled = FALSE)
+```
+
+Or set `OL_ENABLED=false` in the environment before starting R.

@@ -19,10 +19,13 @@ Imports:
 Suggests:
     ontologySpecR,
     duckdb,
+    httr2,
     visNetwork,
     ggraph,
     ggplot2,
     targets,
+    jsonvalidate,
+    withr,
     testthat (>= 3.0.0),
     knitr,
     rmarkdown

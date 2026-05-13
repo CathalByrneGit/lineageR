@@ -1,6 +1,7 @@
 #' Record the start of a transform run
 #'
-#' Inserts a row into `lineage_run_log` with `status = "running"`.
+#' Inserts a row into `lineage_run_log` with `status = "running"` and emits
+#' an OpenLineage `START` event if emission is configured.
 #'
 #' @param ctx A `LineageContext`.
 #' @param transform_node_id `node_id` of the transform being executed.
@@ -15,13 +16,34 @@ lin_run_start <- function(ctx, transform_node_id) {
      VALUES (?, ?, CURRENT_TIMESTAMP, 'running')",
     params = list(run_id, transform_node_id)
   )
+
+  tryCatch({
+    transform  <- .ol_node(ctx, transform_node_id)
+    inputs_df  <- .ol_inputs(ctx,  transform_node_id)
+    outputs_df <- .ol_outputs(ctx, transform_node_id)
+    event <- .ol_run_event(
+      ctx,
+      run_id     = run_id,
+      job_name   = transform$name,
+      event_type = "START",
+      inputs     = lapply(inputs_df$node_id, function(nid)
+        .ol_dataset(ctx, nid, include_schema = TRUE)),
+      outputs    = lapply(outputs_df$node_id, function(nid)
+        .ol_dataset(ctx, nid, include_schema = FALSE))
+    )
+    .ol_emit(ctx, event)
+  }, error = function(e) {
+    cli::cli_warn("OpenLineage START event failed: {conditionMessage(e)}")
+  })
+
   run_id
 }
 
 #' Record the successful completion of a transform run
 #'
-#' Sets `status = "success"` and updates `last_updated_at` on the transform
-#' node and all its output dataset nodes.
+#' Sets `status = "success"`, updates `last_updated_at` on the transform node
+#' and all its output dataset nodes, and emits an OpenLineage `COMPLETE` event
+#' (including column-lineage facets when available).
 #'
 #' @param ctx A `LineageContext`.
 #' @param run_id `run_id` returned by [lin_run_start()].
@@ -48,13 +70,11 @@ lin_run_complete <- function(ctx, run_id, rows_produced = NULL) {
 
   transform_node_id <- run$node_id[1L]
 
-  # Update last_updated_at on the transform itself
   DBI::dbExecute(ctx$con,
     "UPDATE lineage_nodes SET last_updated_at = ? WHERE node_id = ?",
     params = list(now, transform_node_id)
   )
 
-  # Update last_updated_at on all direct output datasets
   output_nodes <- DBI::dbGetQuery(ctx$con,
     "SELECT to_node_id FROM lineage_edges WHERE from_node_id = ?",
     params = list(transform_node_id)
@@ -66,12 +86,33 @@ lin_run_complete <- function(ctx, run_id, rows_produced = NULL) {
     )
   }
 
+  tryCatch({
+    transform  <- .ol_node(ctx, transform_node_id)
+    inputs_df  <- .ol_inputs(ctx,  transform_node_id)
+    outputs_df <- .ol_outputs(ctx, transform_node_id)
+    event <- .ol_run_event(
+      ctx,
+      run_id     = run_id,
+      job_name   = transform$name,
+      event_type = "COMPLETE",
+      inputs     = lapply(inputs_df$node_id, function(nid)
+        .ol_dataset(ctx, nid, include_schema = TRUE)),
+      outputs    = lapply(outputs_df$node_id, function(nid)
+        .ol_dataset(ctx, nid, include_schema = TRUE,
+                    column_lineage = .ol_column_lineage_facet(ctx, nid)))
+    )
+    .ol_emit(ctx, event)
+  }, error = function(e) {
+    cli::cli_warn("OpenLineage COMPLETE event failed: {conditionMessage(e)}")
+  })
+
   invisible(run_id)
 }
 
 #' Record a failed transform run
 #'
-#' Sets `status = "error"` and stores the error message.
+#' Sets `status = "error"`, stores the error message, and emits an OpenLineage
+#' `FAIL` event.
 #'
 #' @param ctx A `LineageContext`.
 #' @param run_id `run_id` returned by [lin_run_start()].
@@ -79,13 +120,36 @@ lin_run_complete <- function(ctx, run_id, rows_produced = NULL) {
 #' @return Invisibly, `run_id`.
 #' @export
 lin_run_error <- function(ctx, run_id, error_message) {
-  now <- Sys.time()
+  now     <- Sys.time()
+  run_row <- DBI::dbGetQuery(ctx$con,
+    "SELECT node_id FROM lineage_run_log WHERE run_id = ?",
+    params = list(run_id)
+  )
   DBI::dbExecute(ctx$con,
     "UPDATE lineage_run_log
      SET status = 'error', completed_at = ?, error_message = ?
      WHERE run_id = ?",
     params = list(now, as.character(error_message), run_id)
   )
+
+  tryCatch({
+    if (nrow(run_row) > 0L) {
+      transform <- .ol_node(ctx, run_row$node_id[1L])
+      if (!is.null(transform)) {
+        event <- .ol_run_event(
+          ctx,
+          run_id        = run_id,
+          job_name      = transform$name,
+          event_type    = "FAIL",
+          error_message = error_message
+        )
+        .ol_emit(ctx, event)
+      }
+    }
+  }, error = function(e) {
+    cli::cli_warn("OpenLineage FAIL event failed: {conditionMessage(e)}")
+  })
+
   invisible(run_id)
 }
 
