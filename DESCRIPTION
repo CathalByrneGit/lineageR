@@ -19,6 +19,7 @@ Imports:
 Suggests:
     ontologySpecR,
     duckdb,
+    digest,
     httr2,
     visNetwork,
     ggraph,

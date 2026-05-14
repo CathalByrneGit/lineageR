@@ -315,22 +315,42 @@ lin_marquez_setup <- function(port = 5000L) {
 
   fields <- list()
   for (i in seq_len(nrow(expr_rows))) {
-    r  <- expr_rows[i, ]
+    r <- expr_rows[i, ]
+
+    # source_node_id and source_columns are stored as JSON arrays
+    src_node_ids <- tryCatch(
+      jsonlite::fromJSON(as.character(r$source_node_id), simplifyVector = TRUE),
+      error = function(e) character(0)
+    )
+    src_columns <- tryCatch(
+      jsonlite::fromJSON(as.character(r$source_columns), simplifyVector = TRUE),
+      error = function(e) character(0)
+    )
+
     tf <- list(
       type        = "DIRECT",
       description = as.character(r$expression_text %||% "")
     )
-    inp <- list(
-      namespace       = ctx$ol_config$namespace,
-      name            = as.character(r$input_dataset_name),
-      field           = as.character(r$input_column),
-      transformations = list(tf)
-    )
-    col <- as.character(r$output_column)
-    if (is.null(fields[[col]])) {
-      fields[[col]] <- list(inputFields = list())
+
+    input_fields <- list()
+    for (nid in src_node_ids) {
+      node     <- .ol_node(ctx, nid)
+      src_name <- if (!is.null(node)) node$name else nid
+      for (col in src_columns) {
+        input_fields <- c(input_fields, list(list(
+          namespace       = ctx$ol_config$namespace,
+          name            = src_name,
+          field           = col,
+          transformations = list(tf)
+        )))
+      }
     }
-    fields[[col]]$inputFields <- c(fields[[col]]$inputFields, list(inp))
+
+    out_col <- as.character(r$output_column)
+    if (is.null(fields[[out_col]])) {
+      fields[[out_col]] <- list(inputFields = list())
+    }
+    fields[[out_col]]$inputFields <- c(fields[[out_col]]$inputFields, input_fields)
   }
 
   list(
